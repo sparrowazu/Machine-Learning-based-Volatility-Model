@@ -16,6 +16,10 @@ This project will explore the different models of volatility prediction, first, 
   
 Data can be found in the data_ml.R file.  
   
+# Model Building  
+  
+The model building process and codes can be found in Final Report file.  
+
 # Members  
   
 Maya Le: GARCH models  
