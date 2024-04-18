@@ -1,0 +1,679 @@
+---
+title: "Building a Machine Learning-based Volatility Prediction Model"
+author: "Maya Le, Jason Yu"
+date: "Winter 2024"
+
+output: 
+    pdf_document:
+      toc: true
+      latex_engine: xelatex
+      number_sections: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include = FALSE, message=FALSE,warning=FALSE}
+library(tidyverse)                     
+library(lubridate) 
+#library(glmnet)
+
+
+library(sn)
+library(PerformanceAnalytics)
+library(car)
+library(tseries)
+library(forecast)
+library(quantmod)
+library(rugarch)
+library(rmgarch)
+library(FinTS)
+
+library(tidyquant) 
+library(timetk) 
+library(tidyr)
+library(kableExtra)
+library(ggplot2)
+library(dplyr)
+
+library(keras)
+```
+\newpage
+
+# Introduction  
+  
+“Volatility is the backbone of finance in the sense that it not only provides an information signal to investors, but it also is an input to various financial models” (Karasan, n.d) 4.   
+  
+Volatility can be seen as uncertainty or risk in the financial market. High-volatility stocks have prices that fluctuate greater and more frequently, and higher stock market volatility often translates to greater investment risks. As a result, modelling and forecasting volatility becomes an important strategy when navigating the stock market.  
+  
+This project will explore the different models of volatility prediction, first, using GARCH(p,q) model, and then LSTM-GARCH hybrid models. This study therefore considers the volatility of the data_ml stock index returns.  
+  
+Many of the codes and methods used in this report, especially data processing, was referred from the Machine Learning for Factor Investing textbook by Guillaume Coquerete and Tony Guida. 
+
+# The Data Set  
+  
+As mentioned in the book "Machine Learning for Factor Investing", this data set comprises information on 1,207 stocks listed in the US (possibly originating from Canada or Mexico). The time range starts in November 1998 and ends in March 2019. For each point in time, 93 characteristics describe the firms in the sample. 
+  
+## Data Pre-processing  
+  
+First, we will perform data pre processing.  
+
+```{r, warning=FALSE}
+setwd("C:/Users/maian/OneDrive - University of Waterloo/Documents/UW/W24/AFM423/Homeworks")
+load("data_ml.RData")
+```  
+
+Data will be grouped by date, and arrange by stock id. We also wish to keep a particular period of time, from December 31, 1999 to January 01, 2019 for modelling purposes.  
+
+```{r}
+data_ml %>%
+    group_by(date)
+data_ml <- data_ml %>% 
+    filter(date > "1999-12-31",         # Keep the date with sufficient data points
+           date < "2019-01-01") %>%
+    arrange(stock_id, date) 
+```
+
+Furthermore, for computation purpose, we will purge the data set of missing values, and keep only the stocks in which we have a complete set of observations.  
+
+```{r}
+stock_ids <- levels(as.factor(data_ml$stock_id)) # A list of all stock_ids
+stock_days <- data_ml %>%                        # Compute the number of data points per stock
+    group_by(stock_id) %>% summarize(nb = n()) 
+stock_ids_short <- stock_ids[which(stock_days$nb == max(stock_days$nb))] # Stocks with full data
+returns <- data_ml %>%                           # Compute returns, in matrix format, in 3 steps:
+    filter(stock_id %in% stock_ids_short) %>%    # 1. Filtering the data
+    dplyr::select(date, stock_id, R1M_Usd) %>%   # 2. Keep returns along with dates & firm names
+    pivot_wider(names_from = "stock_id", 
+                values_from = "R1M_Usd")         # 3. Put in matrix shape 
+```
+
+We also split the data set into training and testing set for later use  
+
+```{r}
+separation_date <- as.Date("2014-01-15")
+training_sample <- filter(returns, date < separation_date)
+testing_sample <- filter(returns, date >= separation_date)
+```
+
+For the purpose of modelling volatility, rather than using the whole set of explanatory variates, we will focus explicitly on R1M_Usd, which is the return forward 1 month. 
+  
+## Portfolio Returns  
+  
+Let's take a look at the portfolio as a whole. Suppose we want to calculate the portfolio returns of N assets. The value of asset $i$, $Vi$, in the portfolio is defined as $Vi = \lambda_{i} * P_i$.  
+
+Here, $\lambda_i$ is the number of shares of asset i, and $Pi$ is the price of asset i.  
+
+The total portfolio value, $V_p$ is defined as  
+$$V_p = \Sigma^{N}_{i=1} V_i$$.  
+  
+The weight of asset i, $w_i$, in the portfolio is then defined as  
+$$w_i = \frac{V_i}{V_p}$$  
+where $V_i$ is the value of asset $i$ and $V_p$ is the total value of the portfolio.  
+  
+The portfolio return at time $t$, $R_t$ is defined as  
+$$R_t = \frac{V_{pi} - V_{pt-1}}{V_{pt-1}}$$  
+  
+where $V_{pt}$ is the portfolio value at time $t$. 
+  
+We will assume that we have an equal-weight portfolio, in which each assets has equal weights, such that weight for asset $i$ is given as:  
+$$ w_i = \frac{1}{N}$$  
+
+
+```{r}
+N <- ncol(returns)-1
+weights <- 1/N
+port_ret <- (rowSums(returns[,-1])*weights)
+port_returns <- data.frame(date = returns$date, returns = port_ret)
+```
+
+Now, let's look at stock 1 returns and the portfolio average returns time series.  
+  
+```{r}
+par(mfrow=c(2,2))
+plot(returns$"1", type = "l", main = "Stock 1")
+plot(port_returns$returns, type = "l", main = "Portfolio")
+acf(returns$"1", main = "Stock 1")
+acf(port_returns$returns, main = "Portfolio")
+```
+
+Overall, the acf indicates that time series are relatively stationary. However, the variance seems non-constant. Thus, this suggests a GARCH(p,q) model. First, we will try GARCH model to the average returns, then to the 793 stocks. We aim to find periods of high volatility or low volatility.  
+
+
+# The GARCH(p,q) Approach  
+  
+The financial market reacts greatly to stress sources, such as economic crises, political changes, etc, and prices of financial assets can fluctuate as a result. In statistic, we measure volatility using variance. Since we want to use the past history to forecast said variance,we are particularly interested in the conditional variance, denoted by  
+  
+$$Var(rt|r_{t-1}, r_{t-2},...) = E(r_t^2|r_{t-1}, r_{t-2},...)$$  
+  
+Intuitively, volatility becomes higher during stressful periods, which could take several periods for the market to become stable again. Therefore, high variance at time t can cause high variance at following times $t+1,t+2,...$.  
+  
+## ARCH(p)    
+  
+An AutoRegressive Conditional Heteroscedasticity (ARCH($p$)) model is defined hierarchically: first define $X_t = \sigma_tZ_t$ where $Z_t \sim^{i.i.d}N(0,1)$, but treat $\sigma_t$ as being random such that  
+$$\sigma_t^2 = \alpha_0 + \alpha_1X_{t-1}^2+...+\alpha_pX_{t-p}^2$$  
+Here, it can be seen that the variance is time dependent = a large value of $X_t$ will result in period of high volatility.  
+As with all forecasting problems, we want to have a stationary time series. Sources of non-stationarity includes trend, seasonality, and non-constant variance. While SARIMA models trend and seasonality, ARCH/GARCH models sources of non-constant variance. For an ARCH(1) model, when $|\alpha_1| < 1$ there exists a unique causal stationary solution.  
+  
+## GARCH(p,q)  
+  
+The GARCH(p,q) model is a generalized version of ARCH(p), which is defined by $X_t = \sigma_tZ_t$ where $Z_t \sim N(0,1)$ i.i.d and  
+$$\sigma_t^2 = \alpha_0 + \Sigma^p_{i=1}\alpha_iX_{t-i}^2 + \Sigma_{i=1}^q\beta_i\sigma^2_{t-i}$$  
+  
+## GARCH(1,1)    
+  
+Suppose we want to fit a GARCH(1,1) process into the market average return.  
+
+```{r}
+Model <- ugarchspec(variance.model = list(model = "sGARCH",
+garchOrder = c(1, 1) ),mean.model = list(armaOrder=c(0,0,0),
+include.mean = FALSE) )
+
+fit <- ugarchfit(data = port_returns$returns, spec = Model)
+
+fit
+```
+We can see that both alpha and beta has small p-values, which suggests that both of the GARCH terms are significant. 
+Overall, GARCH seems to fit the time series very well.
+
+Making a GARCH variance series,  
+
+```{r}
+vole <- ts(fit@fit$sigma^2, start = 2000 +1/12, frequency = 12)
+
+plot(vole, type = "l", main = "Portfolio Returns Volatility GARCH(1,1)")
+```
+
+We could that there is a big spike in volatility, but otherwise variance is relatively low and stable. 
+  
+We can try the same model for Stock 1 just for illustration purpose:  
+```{r}
+fit2 <- ugarchfit(data = returns$"1", spec = Model)
+vole2 <- ts(fit2@fit$sigma^2, start = 2000 +1/12,frequency = 12)
+plot(vole2, type = "l", main = "Stock 1 Returns Volatility GARCH(1,1)")
+```
+Again, we can see big spikes indicating high volatility periods. Overall, individual stocks seems to be much more voltile than average portfolio returns.  
+
+## Exponential GARCH model  
+
+We can also try fitting an exponential GARCH model - eGARCH:  
+
+```{r}
+ModelE <- ugarchspec(variance.model = list(model = "eGARCH",
+garchOrder = c(1, 1) ),mean.model = list(armaOrder=c(0,0,0),
+include.mean = FALSE) )
+
+fit.e <- ugarchfit(data = port_returns$returns, spec = ModelE)
+
+fit.e
+```
+Looking at the output, alpha, beta, and gamma are all significant. We are definitely on the right track here. Let's try plotting this out.  
+
+```{r}
+Evole <- ts(fit.e@fit$sigma^2, start = 2000 +1/12, frequency = 12)
+
+plot(Evole, type = "l", main = "Exponential GARCH")
+```
+Here, it seems that we have a relatively similar time series as the standard GARCH model. To further compare them, we can also plot them on the same plot.
+
+```{r}
+plot(vole, type = "l", main = "sGARCH vs eGARCH", ylim = c(0, 0.025))
+lines(Evole, type="l", col = "red")
+legend("topleft", legend = c("sGARCH", "eGARCH"), col = c("black", "red"), lty = 1, lwd = 2)
+```
+Here, it is easy to see that exponential GARCH has a much higher extreme compared to standard GARCH. 
+
+```{r}
+a <- infocriteria(fit)
+b <- infocriteria(fit.e)
+c <- data.frame("sGARCH" = a, "eGARCH" =b)
+colnames(c) = c("sGARCH", "eGARCH")
+kable(c)
+```
+
+From this table, the standard GARCH seems to have a better fit, as it has a better score across all criteria. 
+  
+## Volatility and Risks  
+  
+Let's circle back and talk about the purpose of this report. Overall, we have a very large data set of over 700 stocks, after purging the ones with missing values. Combining with over 200 observations, this means it is a challenging task to model volatility in a market with such large number of stocks. GARCH model is limited to a specific time series, and while fitting nearly 800 GARCH(1,1) model is technically not very computationally expensive, it's hard to interpret the outcomes.  
+  
+Take a look at this fit_list, which holds 793 GARCH models for all stocks returns.  
+
+```{r,warning = FALSE}
+Model <- ugarchspec(variance.model = list(model = "sGARCH",
+                                          garchOrder = c(1, 1) ),mean.model = list(armaOrder=c(0,0,0),
+                                                                                   include.mean = FALSE) )
+
+fit_list <- list()
+returns <- as.data.frame(returns)
+
+ugarch <- function(x){
+  ugarchfit(data = x, spec = Model)
+}
+
+ret <- returns[,-1]
+fit_list <- apply(ret,2,ugarch)
+```
+
+This fit_list, which is already a large item itself, contains even more information within each fitted models. Here, I attempted to get the fit criteria for each stock.  
+  
+```{r}
+remove(aic)
+aic_df <- c
+models <- c(names(fit_list))
+
+for (model_name in names(fit_list)) {
+  model <- fit_list[[model_name]]
+  tryCatch({
+    aic <- infocriteria(model)
+    aic_df <- cbind(aic_df, aic)
+  }, error = function(e) {
+    cat("Error computing AIC for model", model_name, ":", conditionMessage(e), "\n")
+  })
+}
+
+models <- c("sGARCH", "eGARCH", models[models !="108"])
+colnames(aic_df) <- models
+
+min(aic_df[1,])
+
+most_fit <- names(aic_df[which.min(aic_df[1,])])
+most_fit
+```
+It seems that the GARCH(1,1) model for stock 570 has the best fit with AIC value of -3.290334.
+
+Let's take a look at this stock.  
+
+```{r}
+mod_570 <- fit_list$"570"
+ts_570 <- ts(mod_570@fit$sigma^2, start = 2000 +1/12, frequency = 12)
+
+par(mfrow=c(1,2))
+plot(returns$"570", type="l", main = "Stock 570", ylab = "Return")
+plot(ts_570, type = "l", main = "Volatility", ylab = "")
+```
+It seems that GARCH models the volatility of this stock quite well. We can also perform forecasting using ugarchforcast 
+  
+```{r}
+ugfore <- ugarchforecast(mod_570, n.ahead = 10)
+ugfore
+```
+Putting these forecast with the last 50 estimated observations:  
+
+```{r}
+ug_f <- ugfore@forecast$sigmaFor
+
+ug_res2 <- mod_570@fit$residuals^2
+ug_var <- mod_570@fit$var
+
+ug_var_t <- c(tail(ug_var, 20), rep(NA, 10))
+ug_res2_t <- c(tail(ug_res2,20),rep(NA,10))
+ug_f <- c(rep(NA, 20), ug_f^2)
+
+par(mfrow = c(1,2))
+plot(ug_f, type = "l", main = "Volatility Forecast", xlim = c(20, 30))
+plot(ug_res2_t, type = "l", main = "Observed vs Forecast")
+lines(ug_f, col = "blue")
+lines(ug_var_t, col = "red")
+```
+```{r}
+ug_var_t <- na.omit(ug_var_t)
+ug_res2_t <- na.omit(ug_res2_t)
+mse <- mean((ug_var_t - ug_res2_t)^2)
+mse
+```
+
+From this plot, it is clear that the forecast of the conditional variance picks up from the last estimated conditional variance. After a period of high volatility, it picked up the tren and moving up to the unconditional variance value.  
+
+Here is a peak of the model with the highest AIC:  
+  
+```{r}
+max(aic_df[1,])
+
+least_fit <- names(aic_df[which.max(aic_df[1,])])
+least_fit
+```
+```{r}
+mod_296 <- fit_list$"296"
+ts_296 <- ts(mod_570@fit$sigma^2, start = 2000 +1/12, frequency = 12)
+
+par(mfrow=c(1,2))
+plot(returns$"296", type="l", main = "Stock 296", ylab = "Return")
+plot(ts_570, type = "l", main = "Volatility", ylab = "")
+```
+
+## Multivariate GARCH  
+  
+So far, we have considered each stocks' volatility as independent of each other. Building onto the Univariate GARCH model, the multivariate GARCH can consider multiple time series. MGARCH allows us to consider the co-movements of numerous stocks. Here, we assume that we are using the same univariate volatility model specification for each stocks.  
+  
+```{r}
+uspec.n = multispec(replicate(793, 
+                              ugarchspec(variance.model = list(model = "sGARCH",
+                                         garchOrder = c(1, 1) ),
+                                         mean.model = list(armaOrder=c(0,0,0),
+                                         include.mean = FALSE) )))
+```
+
+Now we estimate these univariate models.  
+  
+```{r}
+multf = multifit(uspec.n, ret)
+```
+For multivariates, DCC-GARCH allows the correlation matrix to depend of the time, which fits the purpose of volatility prediction. However, it should be noted that DCC can't model volatility spillovers. We will specify DCC model as followed:  
+
+```{r}
+spec1 <- dccspec(uspec = uspec.n, dccOrder = c(1,1), distribution = "mvnorm")
+```
+
+Finally, we can estimate the model. More specifically, we want to estimate the model as specified in spec1 using the return data of 793 stocks. fit.control ensures the estimation procedure produces standard errors for estimated parameters, and we use the already estimated univariate models of in multf.  
+
+```{r,warning=FALSE}
+fit1 <- dccfit(spec1, data = ret, fit.control = list(eval.se = TRUE), fit = multf)
+```
+Extracting time-variation in the correlation between the assets:  
+  
+```{r}
+tryCatch(rcov(fit1), error = function(e) {
+    cat("Unable to calculate rcov")
+  }) 
+```
+```{r}
+tryCatch(rcor(fit1), error = function(e){
+  cat("Unable to calculate rcor")
+})
+```
+It seems that R was unable to produce a covariance/ correlation matrix. This error was probably due to the fact that this is such a large data set with 793 stocks/ models, thus calculating a correlation matrix is extremely computationally expensive, since we would get a 793x793 matrix. Therefore the question becomes: is there an efficient way to model Volatility while optimizing the amount of data we have?  
+  
+Over the next section, we will go over the Machine Learning approach, which hopefully will improve upon the above limitations. 
+  
+
+# The LSTM Approach  
+  
+In this section, we will attempt to train all returns data, while treating stock ids as a features. As stated above, even though GARCH(1,1) is extremely effective in modelling one time series, multivariate GARCH becomes computationally expensive as the number of assets increases. Thus, we turn to Machine Learning to overcome this limitation. Since we are working with time series, one approach is to use Recurrent Neural Network.  
+  
+The benefit of an RNN is that it can accumulate a hidden state that encodes input over time. However, it is difficult to maintain information in its hidden state for a long time. As we work with historical data, we would want a tool that can learn long-term dependencies.  
+  
+Improving upon RNN, Long Short Term Memory includes an additional hidden state that persists from step to step. It does not pass through an activation function or get multiplied by the connection weights at each time. Thus, we can avoid long-term dependencies problems.  
+  
+## A single stock  
+  
+To begin, let's start with the first stock in our data set.  
+
+```{r}
+data <- returns$`1`  # stock numer 1 Full
+create_sequences <- function(data, n_steps) {
+  X <- array(dim = c(length(data) - n_steps, n_steps, 1))
+  y <- vector(length = length(data) - n_steps)
+  
+  for (i in 1:(length(data) - n_steps)) {
+    X[i,,1] <- data[i:(i + n_steps - 1)]
+    y[i] <- data[i + n_steps]
+  }
+  
+  return(list(X, y))
+}
+```
+  
+To train the model, we need to start with the data split.  
+
+```{r}
+n_steps <- 10
+dataset <- create_sequences(data, n_steps)
+X <- dataset[[1]]
+y <- dataset[[2]]  
+  
+set.seed(123) # For reproducibility
+indices <- sample(1:nrow(X), size = 0.8 * nrow(X))  # Warning different test and train set this one is random 8-2 Split
+X_train <- X[indices,,]
+y_train <- y[indices]
+X_test <- X[-indices,,]
+y_test <- y[-indices]
+```
+  
+we can now build a LSTM model using the keras_model_sequential function, and adding layers on top.  
+
+```{r, results = "hide", warning = FALSE}
+model <- keras_model_sequential() %>%
+  layer_lstm(units = 60, return_sequences = TRUE, input_shape = c(n_steps, 1)) %>%
+  layer_lstm(units = 50, return_sequences = FALSE) %>%
+  layer_dropout(rate = 0.5) %>%
+  layer_dense(units = 1)
+
+
+model %>% compile(
+  optimizer = 'adam',
+  loss = 'mse'
+)
+
+history <- model %>% fit(
+  X_train, y_train,
+  epochs = 50,
+  batch_size = 32,
+  validation_split = 0.2
+)
+```
+
+Thus, we have the predicted results as:  
+
+```{r, warning = FALSE}
+model %>% evaluate(X_test, y_test)
+
+predictions <- model %>% predict(X_test)
+plot(y_test, type = 'l', ylim = range(c(y_test, predictions)), main = "Prediction")
+lines(predictions, col = 'red')
+legend("topleft", legend = c("y_test", "predictions"), col = c("black", "red"), lty = 1, lwd = 2)
+```
+As we can see, LSTM picked up the variance from the data set. However, it seems to fail to pick up larger spikes.  
+We have mse of 0.01023. However, comparing with the mse of GARCH model, which was 8.288e-06, it seems that GARCH out-performed LSTM.    
+
+```{r}
+mse <- mean((predictions-y_test)^2)
+mse
+```  
+  
+## Full data set  
+  
+Now, we try to fit all stock data at once. Following the same steps as above, we first split the testing and training data.  
+
+```{r, warning=FALSE,message=FALSE}
+returns$date <- NULL
+create_sequences <- function(data, n_steps) {
+  n_obs <- nrow(data)
+  n_cols <- ncol(data)
+  
+  # Pre-allocate the arrays for inputs (X) and outputs (y)
+  X <- array(dim = c(n_obs - n_steps, n_steps, n_cols))
+  y <- matrix(nrow = n_obs - n_steps, ncol = n_cols)
+  
+  # Populate the arrays
+  col_names <- names(data)
+  for (j in 1:n_cols){
+    stock_data <- pull(data, !!sym(col_names[j]))  # Use pull to extract column as a vector
+    for (i in 1:(n_obs - n_steps)) {
+      X[i, , j] <- stock_data[i:(i + n_steps - 1)]
+      y[i, j] <- stock_data[i + n_steps]
+    }
+  }
+  
+  list(X, y)
+}
+
+n_steps <- 20
+dataset <- create_sequences(returns, n_steps)
+X <- dataset[[1]]
+y <- dataset[[2]]
+
+
+indices <- sample(1:nrow(X), size = 0.8 * nrow(X))
+X_train <- X[indices,,]
+y_train <- y[indices,]
+X_test <- X[-indices,,]
+y_test <- y[-indices,]
+```  
+  
+Next, the activation function  
+  
+```{r,warning=FALSE,message=FALSE,results='hide'}
+model <- keras_model_sequential() %>%
+  layer_lstm(units = 50, return_sequences = FALSE, input_shape = c(n_steps, ncol(returns))) %>%
+  layer_dropout(rate = 0.2) %>%
+  layer_dense(units = ncol(returns))
+
+model %>% compile(
+  optimizer = 'adam',
+  loss = 'mse'
+)
+
+```
+```{r, include=FALSE}
+
+history <- model %>% fit(
+  X_train, y_train,
+  epochs = 50,
+  batch_size = 32,
+  validation_split = 0.2
+)
+```
+
+```{r}
+model <- keras_model_sequential() %>%
+  layer_lstm(units = 20, return_sequences = TRUE, input_shape = c(n_steps, ncol(returns))) %>%
+  layer_dropout(rate = 0.2) %>%
+  layer_lstm(units = 50, kernel_regularizer = regularizer_l2(0.01)) %>%
+  layer_dense(units = ncol(returns))
+```
+
+
+
+In this part, we will try different optimizer functions, and compare their performance.  
+  
+For SGD with momentum and Nesterov accelerated gradient:  
+
+```{r}
+optimizer_sgd <- optimizer_sgd(learning_rate = 0.01, momentum = 0.9, nesterov = TRUE)
+#0.06103797 0.07517219 #This one decays So-So
+```
+
+For RMSprop
+
+```{r}
+optimizer_rmsprop <- optimizer_rmsprop(learning_rate = 0.001, rho = 0.9)
+#0.01275908 0.07578062  So-So
+```
+
+For Adagrad
+
+```{r}
+optimizer_adagrad <- optimizer_adagrad(learning_rate = 0.01)
+#0.21223037 0.07525495 need way more ssteps
+#0.02856970 0.07516009 with 500 look the best
+```
+
+For Adadelta
+
+```{r}
+optimizer_adadelta <- optimizer_adadelta(learning_rate = 1.0, rho = 0.95)
+#0.01268456 0.07554621 So-So
+```
+
+Overall, it seems that Adagrad (Adaptive Gradient Algorithm) has the best performance. Thus, we will choose this optimizer.  
+  
+```{r}
+model %>% compile(
+  optimizer = optimizer_adagrad,
+  loss = 'mse',
+  metrics = c('mae')
+)
+
+optimizer_adagrad <- optimizer_adagrad(learning_rate = 0.01)
+
+early_stopping_callback <- callback_early_stopping(monitor = "val_loss", patience = 5)
+
+
+```
+```{r,include = FALSE}
+history <- model %>% fit(
+  X_train, y_train,
+  epochs = 150,
+  batch_size = 32,
+  #shuffle = TRUE,
+  validation_split = 0.2,
+  callbacks = early_stopping_callback
+)
+
+```
+
+```{r}
+model %>% evaluate(X_test, y_test)
+```
+# Conclusion  
+In conclusion, volatility stands as a fundamental pillar within the realm of finance, serving not only as an informative signal for investors but also as a crucial input for numerous financial models. By exploring various volatility prediction models, we aim to further understand the impacts of volatility in prediction stocks' returns.  
+Overall, it seems that even though LSTM solved the limitations of GARCH, it seems that it didn't pick up the volatility of the stocks as well as GARCH did. GARCH(1,1) did perform very well for individual stocks, as it could pick up spikes and high volatility periods relatively well. Multivariate GARCH models could also work if we have a smaller size portfolios.  
+  
+## Limitations  
+  
+Some of limitations of the report includes the fact that modelling volatility of stocks is extremely complex when considering interactions between a large amount of assets. In this case, we have 793 assets, and while we could model each stock's volatility separately, using the whole data set could bring challenges.   
+  
+## Other Approaches  
+  
+Based on the foundation of GARCH, there are also other Machine Learning approaches to model volatility. One approach is to forecast volatility with Support Vector Machine-based GARCH models, which might improve upon the stated methods.   
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  
+
+
+  
+
+
+
+  
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
