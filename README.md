@@ -1,0 +1,16 @@
+# Building a Machine Learning-based Volatility Prediction Model  
+  
+This project will explore the different models of volatility prediction, first, using GARCH(p,q) model, and then LSTM-GARCH hybrid models. This study therefore considers the volatility of the data_ml stock index returns. 
+  
+# Data  
+  
+Data can be found in the data_ml.R file.  
+  
+# Model Building  
+  
+The model building process and codes can be found in Final Report file.  
+
+# Members  
+  
+Maya Le: GARCH models  
+Jason Yu: LSTM-GARCH  
